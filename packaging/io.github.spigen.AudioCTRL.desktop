@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Spigen Audio CTRL
+Comment=Control Spigen SA-HP P10 headphones
+Exec=spigen-audio-ctrl
+Icon=spigen-audio-ctrl
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=Spigen;headphones;Bluetooth;ANC;equalizer;
+StartupNotify=true

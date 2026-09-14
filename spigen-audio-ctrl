@@ -1,0 +1,4 @@
+#!/usr/bin/env python3
+from spigen_audio_ctrl.app import main
+
+raise SystemExit(main())
