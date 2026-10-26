@@ -16,8 +16,9 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 
+from . import qcy_protocol  # noqa: E402
 from .bluetooth import BluetoothService  # noqa: E402
-from .protocol import EQ_FREQUENCIES, HardwareInfo  # noqa: E402
+from .protocol import EQ_FREQUENCIES as HEADPHONE_EQ_FREQUENCIES, HardwareInfo  # noqa: E402
 
 
 PRESETS: dict[str, list[float]] = {
@@ -66,6 +67,17 @@ REMAP_ROWS = (
     RemapRow("+", "Volume Up Button", "Long Press", 5, 5, 3),
     RemapRow("−", "Volume Down Button", "Single Click", 3, 1, 6),
     RemapRow("−", "Volume Down Button", "Long Press", 3, 5, 2),
+)
+
+# SA-TW P10 gestures are single event ids (1-6); ``action`` is unused but keeps
+# the row model shared with the headphone key map.
+TWS_REMAP_ROWS = (
+    RemapRow("L", "Left Earbud", "Single Touch", 1, 0, 0),
+    RemapRow("L", "Left Earbud", "Double Touch", 3, 0, 1),
+    RemapRow("L", "Left Earbud", "Triple Touch", 5, 0, 4),
+    RemapRow("R", "Right Earbud", "Single Touch", 2, 0, 0),
+    RemapRow("R", "Right Earbud", "Double Touch", 4, 0, 1),
+    RemapRow("R", "Right Earbud", "Triple Touch", 6, 0, 3),
 )
 
 
@@ -188,10 +200,24 @@ class MainWindow(Gtk.ApplicationWindow):
         self.service = BluetoothService()
         self.service.on_connection = self.on_connection
         self.service.on_battery = self.on_battery
+        self.service.on_battery_state = self.on_battery_state
+        self.service.on_profile = self.on_profile
         self.service.on_hardware_info = self.on_hardware_info
+        self.service.on_noise_mode = self.on_noise_mode
+        self.service.on_gaming_state = self.on_gaming_state
+        self.service.on_sleep_state = self.on_sleep_state
+        self.service.on_equalizer = self.on_equalizer
+        self.service.on_key_map = self.on_key_map
+        self.profile = "headphones"
+        self._profile_applied = False
         self.gains = [0.0] * 10
         self.scales: list[Gtk.Scale] = []
         self.gain_labels: list[Gtk.Label] = []
+        self.freq_labels: list[Gtk.Label] = []
+        self.anc_buttons: list[tuple[int, int, int, Gtk.ToggleButton]] = []
+        self.tws_battery_labels: dict[str, tuple[Gtk.Label, Gtk.LevelBar]] = {}
+        self.gaming_switch: Gtk.Switch | None = None
+        self.sleep_switch: Gtk.Switch | None = None
         self.remap_combos: dict[str, Gtk.ComboBoxText] = {}
         self.eq_timeout: int | None = None
         self.graph_band = -1
@@ -231,9 +257,9 @@ class MainWindow(Gtk.ApplicationWindow):
         device_top.append(centered_label("♫", "device-orb"))
         identity = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         identity.set_hexpand(True)
-        self.device_name_label = label("SA-HP P10", "device-name")
+        self.device_name_label = label("Spigen P10", "device-name")
         identity.append(self.device_name_label)
-        self.device_subtitle = label("Looking for headphones", "subtle")
+        self.device_subtitle = label("Looking for a Spigen audio device", "subtle")
         self.device_subtitle.set_wrap(True)
         identity.append(self.device_subtitle)
         device_top.append(identity)
@@ -253,7 +279,30 @@ class MainWindow(Gtk.ApplicationWindow):
         self.battery_bar.set_mode(Gtk.LevelBarMode.CONTINUOUS)
         self.battery_box.append(self.battery_bar)
         device_card.append(self.battery_box)
-        self.firmware_label = label("", "tiny")
+
+        # TWS earbuds report three independent batteries. The vendor app shows
+        # left, right and charging-case levels in the same place as a single
+        # headphone battery, so keep both boxes and reveal the active profile.
+        self.tws_battery_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        self.tws_battery_box.set_visible(False)
+        for key, tag_text in (("left", "L"), ("right", "R"), ("case", "CASE")):
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            tag = label(tag_text, "tiny")
+            tag.set_size_request(30, -1)
+            row.append(tag)
+            bar = Gtk.LevelBar.new_for_interval(0, 100)
+            bar.add_css_class("battery-track")
+            bar.set_mode(Gtk.LevelBarMode.CONTINUOUS)
+            bar.set_hexpand(True)
+            row.append(bar)
+            value = label("—", "battery")
+            value.set_xalign(1)
+            value.set_size_request(42, -1)
+            row.append(value)
+            self.tws_battery_box.append(row)
+            self.tws_battery_labels[key] = (value, bar)
+        device_card.append(self.tws_battery_box)
+        self.firmware_label = label("", "tiny", wrap=True)
         self.firmware_label.set_visible(False)
         device_card.append(self.firmware_label)
         sidebar.append(device_card)
@@ -308,12 +357,22 @@ class MainWindow(Gtk.ApplicationWindow):
         page.append(heading)
         return page, heading
 
+    def _anc_entries(self) -> tuple[tuple[str, str, str, str, int, int, int], ...]:
+        """Normalise the headphone and earbud ANC tables to one tile shape."""
+        if self.profile == "tws":
+            return qcy_protocol.ANC_MODES
+        return tuple(
+            (name, tag, description, icon, anc_id, anc_id, anc_id)
+            for name, tag, description, icon, anc_id in ANC_MODES
+        )
+
     def _build_anc_page(self) -> Gtk.Widget:
         page, _ = self._page("Noise Control", "Select active acoustic isolation or ambient transparency profile")
         grid = Gtk.Grid(column_spacing=10, row_spacing=10, column_homogeneous=True, row_homogeneous=True)
         grid.set_vexpand(True)
         group = None
-        for index, (name, tag, description, icon, anc_id) in enumerate(ANC_MODES):
+        self.anc_buttons = []
+        for index, (name, tag, description, icon, value, minimum, maximum) in enumerate(self._anc_entries()):
             button = Gtk.ToggleButton()
             button.add_css_class("anc-tile")
             if group:
@@ -330,10 +389,24 @@ class MainWindow(Gtk.ApplicationWindow):
             box.append(top)
             box.append(label(description, "subtle", wrap=True))
             button.set_child(box)
-            button.connect("toggled", self._on_anc_toggled, anc_id)
             grid.attach(button, index % 3, index // 3, 1, 1)
-            if index == 1:
-                button.set_active(True)
+            self.anc_buttons.append((value, minimum, maximum, button))
+
+        # Set the initial selection before connecting signals so rebuilding the
+        # page while connected never sends a command on its own.
+        active_index = 1
+        if self.profile == "tws":
+            active_index = 0
+            noise_mode = getattr(self.service, "noise_mode", None)
+            if noise_mode is not None:
+                for index, (_value, minimum, maximum, _button) in enumerate(self.anc_buttons):
+                    if minimum <= noise_mode <= maximum:
+                        active_index = index
+                        break
+        if 0 <= active_index < len(self.anc_buttons):
+            self.anc_buttons[active_index][3].set_active(True)
+        for value, _minimum, _maximum, button in self.anc_buttons:
+            button.connect("toggled", self._on_anc_toggled, value)
         page.append(grid)
 
         gaming_card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
@@ -343,16 +416,39 @@ class MainWindow(Gtk.ApplicationWindow):
         gaming_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         gaming_text.set_hexpand(True)
         gaming_text.append(label("Low-Latency Gaming Mode", "device-name"))
-        gaming_text.append(label("Reduces wireless audio transmission delay to ~45 ms", "subtle"))
+        gaming_text.append(label("Reduces wireless audio latency for gaming and video", "subtle"))
         gaming_card.append(gaming_text)
         self.gaming_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+        if self.service.gaming_mode is not None:
+            self.gaming_switch.set_active(self.service.gaming_mode)
         self.gaming_switch.connect("notify::active", self._on_gaming_toggled)
         gaming_card.append(self.gaming_switch)
         page.append(gaming_card)
+
+        self.sleep_switch = None
+        if self.profile == "tws":
+            sleep_card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            sleep_card.add_css_class("card")
+            sleep_card.append(centered_label("☾", "accent-icon"))
+            sleep_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            sleep_text.set_hexpand(True)
+            sleep_text.append(label("Sleep Mode", "device-name"))
+            sleep_text.append(label("Temporarily disables touch controls to prevent accidental input", "subtle"))
+            sleep_card.append(sleep_text)
+            self.sleep_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+            if self.service.sleep_mode is not None:
+                self.sleep_switch.set_active(self.service.sleep_mode)
+            self.sleep_switch.connect("notify::active", self._on_sleep_toggled)
+            sleep_card.append(self.sleep_switch)
+            page.append(sleep_card)
         return page
 
     def _build_eq_page(self) -> Gtk.Widget:
-        page, heading = self._page("10-Band DSP Equalizer", "Fine-tune 16-bit parametric hardware filters stored on-chip")
+        page, heading = self._page(
+            "10-Band Hardware Equalizer",
+            "Fine-tune the on-device equalizer; changes are stored in the hardware",
+        )
+        self.freq_labels = []
         controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         heading.append(controls)
         self.preset_combo = Gtk.ComboBoxText()
@@ -386,7 +482,7 @@ class MainWindow(Gtk.ApplicationWindow):
 
         rack = Gtk.Grid(column_homogeneous=True, column_spacing=4)
         rack.add_css_class("card")
-        for index, frequency in enumerate(EQ_FREQUENCIES):
+        for index, frequency in enumerate(HEADPHONE_EQ_FREQUENCIES):
             column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
             gain_label = label("+0dB", "device-name")
             gain_label.set_xalign(0.5)
@@ -404,6 +500,7 @@ class MainWindow(Gtk.ApplicationWindow):
             freq_label = label(text, "subtle")
             freq_label.set_xalign(0.5)
             column.append(freq_label)
+            self.freq_labels.append(freq_label)
             rack.attach(column, index, 0, 1, 1)
         page.append(rack)
 
@@ -414,14 +511,21 @@ class MainWindow(Gtk.ApplicationWindow):
         self._apply_preset("Harman Audiophile Target", send=False)
         return page
 
+    def _remap_rows(self) -> tuple[RemapRow, ...]:
+        return TWS_REMAP_ROWS if self.profile == "tws" else REMAP_ROWS
+
+    def _functions(self) -> tuple[tuple[int, str], ...]:
+        return qcy_protocol.KEY_FUNCTIONS if self.profile == "tws" else FUNCTIONS
+
     def _build_buttons_page(self) -> Gtk.Widget:
-        page, _ = self._page("Button Remapping", "Customize gestures and physical key actions stored in headphone memory")
+        page, _ = self._page("Button Remapping", "Customize gestures and touch controls stored in device memory")
         scroller = Gtk.ScrolledWindow()
         scroller.set_vexpand(True)
         rows_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         rows_box.add_css_class("card")
         scroller.set_child(rows_box)
-        for row in REMAP_ROWS:
+        self.remap_combos = {}
+        for row in self._remap_rows():
             line = Gtk.Grid(column_spacing=16)
             line.add_css_class("remap-row")
             left = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=9)
@@ -433,7 +537,7 @@ class MainWindow(Gtk.ApplicationWindow):
             gesture.set_size_request(125, -1)
             line.attach(gesture, 1, 0, 1, 1)
             combo = Gtk.ComboBoxText()
-            for function_id, function_name in FUNCTIONS:
+            for function_id, function_name in self._functions():
                 combo.append(str(function_id), function_name)
             combo.set_active_id(str(row.default_function))
             combo.set_size_request(190, -1)
@@ -466,6 +570,13 @@ class MainWindow(Gtk.ApplicationWindow):
             self.connect_button.set_label("Disconnect")
             self.connect_button.remove_css_class("primary-button")
             self.connect_button.add_css_class("danger-button")
+            if self.profile == "tws":
+                self.battery_box.set_visible(False)
+                self.tws_battery_box.set_visible(True)
+            else:
+                self.tws_battery_box.set_visible(False)
+                if self.service.battery_level is not None:
+                    self.on_battery(self.service.battery_level)
         else:
             connecting = status.startswith("Connecting")
             failed = status.startswith("Error:")
@@ -479,11 +590,148 @@ class MainWindow(Gtk.ApplicationWindow):
                 self.device_subtitle.set_text(status.removeprefix("Error: "))
             else:
                 self.device_subtitle.set_text("No device attached")
-            self.connect_button.set_label("Connecting…" if connecting else ("Try Again" if failed else "Pair Headphones"))
+            if connecting:
+                button_text = "Connecting…"
+            elif failed:
+                button_text = "Try Again"
+            else:
+                button_text = "Pair Earbuds" if self.profile == "tws" else "Pair Headphones"
+            self.connect_button.set_label(button_text)
             self.connect_button.remove_css_class("danger-button")
             self.connect_button.add_css_class("primary-button")
             self.battery_box.set_visible(False)
+            self.tws_battery_box.set_visible(False)
             self.firmware_label.set_visible(False)
+        return GLib.SOURCE_REMOVE
+
+    def on_profile(self, profile: str) -> bool:
+        previous = self.profile
+        self.profile = profile
+        self._apply_profile(previous)
+        return GLib.SOURCE_REMOVE
+
+    def _apply_profile(self, previous: str) -> None:
+        tws = self.profile == "tws"
+        if tws:
+            self.battery_box.set_visible(False)
+            self.tws_battery_box.set_visible(self.service.connected)
+            frequencies = qcy_protocol.EQ_FREQUENCIES
+        else:
+            self.tws_battery_box.set_visible(False)
+            frequencies = HEADPHONE_EQ_FREQUENCIES
+        for widget, frequency in zip(self.freq_labels, frequencies):
+            text = f"{frequency / 1000:g}k" if frequency >= 1000 else str(frequency)
+            widget.set_text(text)
+        # The Harman reference curve is tuned for the headphone DSP; hide it on
+        # the earbuds but keep the same editable 10-band graph.
+        self.harman_check.set_visible(not tws)
+        self.harman_check.set_active(not tws)
+        self.eq_graph.queue_draw()
+        if (tws and not self._profile_applied) or previous != self.profile:
+            self._replace_page("anc", self._build_anc_page())
+            self._replace_page("buttons", self._build_buttons_page())
+        self._profile_applied = True
+        if not self.service.connected:
+            self.connect_button.set_label("Pair Earbuds" if tws else "Pair Headphones")
+
+    def _replace_page(self, name: str, widget: Gtk.Widget) -> None:
+        visible = self.stack.get_visible_child_name()
+        old = self.stack.get_child_by_name(name)
+        if old is not None:
+            self.stack.remove(old)
+        self.stack.add_named(widget, name)
+        if visible:
+            self.stack.set_visible_child_name(visible)
+
+    def on_battery_state(self, state: qcy_protocol.BatteryState) -> bool:
+        entries = (
+            ("left", state.left, state.left_charging),
+            ("right", state.right, state.right_charging),
+            ("case", state.case, state.case_charging),
+        )
+        for key, level, charging in entries:
+            value, bar = self.tws_battery_labels[key]
+            if level is None:
+                value.set_text("—")
+                value.set_tooltip_text(None)
+                bar.set_value(0)
+                value.remove_css_class("battery-low")
+                bar.remove_css_class("low")
+                continue
+            value.set_text(f"{'⚡ ' if charging else ''}{level}%")
+            value.set_tooltip_text("Charging" if charging else None)
+            bar.set_value(level)
+            low = level <= 20
+            if low:
+                value.add_css_class("battery-low")
+                bar.add_css_class("low")
+            else:
+                value.remove_css_class("battery-low")
+                bar.remove_css_class("low")
+        self.tws_battery_box.set_visible(self.profile == "tws" and self.service.connected)
+        return GLib.SOURCE_REMOVE
+
+    def on_noise_mode(self, value: int) -> bool:
+        if self.profile != "tws":
+            return GLib.SOURCE_REMOVE
+        mode = qcy_protocol.anc_mode_for_value(value)
+        if mode is None:
+            return GLib.SOURCE_REMOVE
+        self.updating_hardware = True
+        try:
+            for _value, minimum, maximum, button in self.anc_buttons:
+                if minimum <= value <= maximum:
+                    button.set_active(True)
+                    break
+        finally:
+            self.updating_hardware = False
+        return GLib.SOURCE_REMOVE
+
+    def on_gaming_state(self, enabled: bool) -> bool:
+        if self.profile != "tws" or self.gaming_switch is None:
+            return GLib.SOURCE_REMOVE
+        self.updating_hardware = True
+        try:
+            self.gaming_switch.set_active(enabled)
+        finally:
+            self.updating_hardware = False
+        return GLib.SOURCE_REMOVE
+
+    def on_sleep_state(self, enabled: bool) -> bool:
+        if self.profile != "tws" or self.sleep_switch is None:
+            return GLib.SOURCE_REMOVE
+        self.updating_hardware = True
+        try:
+            self.sleep_switch.set_active(enabled)
+        finally:
+            self.updating_hardware = False
+        return GLib.SOURCE_REMOVE
+
+    def on_equalizer(self, gains: list[float]) -> bool:
+        if self.profile != "tws":
+            return GLib.SOURCE_REMOVE
+        self.updating_hardware = True
+        try:
+            for index, gain in enumerate(gains[:10]):
+                self.gains[index] = float(gain)
+                if index < len(self.scales):
+                    self.scales[index].set_value(gain)
+        finally:
+            self.updating_hardware = False
+        self.eq_graph.queue_draw()
+        return GLib.SOURCE_REMOVE
+
+    def on_key_map(self, mapping: dict[int, int]) -> bool:
+        if self.profile != "tws":
+            return GLib.SOURCE_REMOVE
+        self.updating_hardware = True
+        try:
+            for event, function in mapping.items():
+                combo = self.remap_combos.get(f"{event}_0")
+                if combo:
+                    combo.set_active_id(str(function))
+        finally:
+            self.updating_hardware = False
         return GLib.SOURCE_REMOVE
 
     def on_battery(self, level: int) -> bool:
@@ -507,7 +755,7 @@ class MainWindow(Gtk.ApplicationWindow):
             if info.firmware:
                 self.firmware_label.set_text(f"Firmware  {info.firmware}")
                 self.firmware_label.set_visible(True)
-            if info.gaming_mode is not None:
+            if info.gaming_mode is not None and self.gaming_switch is not None:
                 self.gaming_switch.set_active(info.gaming_mode)
             for key, function in info.key_settings.items():
                 combo = self.remap_combos.get(key)
@@ -518,19 +766,24 @@ class MainWindow(Gtk.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _on_anc_toggled(self, button: Gtk.ToggleButton, anc_id: int) -> None:
-        if button.get_active() and self.service.connected:
+        if button.get_active() and not self.updating_hardware and self.service.connected:
             self.service.set_anc_mode(anc_id)
 
     def _on_gaming_toggled(self, switch: Gtk.Switch, _param) -> None:
         if not self.updating_hardware and self.service.connected:
             self.service.set_gaming_mode(switch.get_active())
 
+    def _on_sleep_toggled(self, switch: Gtk.Switch, _param) -> None:
+        if not self.updating_hardware and self.service.connected and self.profile == "tws":
+            self.service.set_sleep_mode(switch.get_active())
+
     def _on_scale_changed(self, scale: Gtk.Scale, index: int) -> None:
         gain = round(scale.get_value() * 2) / 2
         self.gains[index] = gain
         self.gain_labels[index].set_text(f"{gain:+g}dB")
         self.eq_graph.queue_draw()
-        self._debounce_eq()
+        if not self.updating_hardware:
+            self._debounce_eq()
 
     def _debounce_eq(self) -> None:
         if self.eq_timeout is not None:
@@ -547,7 +800,7 @@ class MainWindow(Gtk.ApplicationWindow):
     def _on_preset_changed(self, combo: Gtk.ComboBoxText) -> None:
         name = combo.get_active_text()
         if name:
-            self._apply_preset(name)
+            self._apply_preset(name, send=not self.updating_hardware)
 
     def _apply_preset(self, name: str, send: bool = True) -> None:
         gains = self.presets.get(name)
@@ -729,7 +982,10 @@ class MainWindow(Gtk.ApplicationWindow):
     def _on_remap_changed(self, combo: Gtk.ComboBoxText, row: RemapRow) -> None:
         active = combo.get_active_id()
         if active is not None and not self.updating_hardware and self.service.connected:
-            self.service.set_key_mapping(row.key_number, row.action, int(active))
+            if self.profile == "tws":
+                self.service.set_key_function(row.key_number, int(active))
+            else:
+                self.service.set_key_mapping(row.key_number, row.action, int(active))
 
     def _on_close(self, _window) -> bool:
         if self.eq_timeout is not None:
